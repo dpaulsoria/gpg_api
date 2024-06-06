@@ -1,38 +1,85 @@
 // src/api/user_management.rs
-use actix_web::{post, web, HttpResponse, Responder};
+use actix_web::{post, get, web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use sqlx::types::Uuid;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::{info, error};
+
+static COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Serialize, Deserialize)]
 struct User {
+    id: usize,
     username: String,
     password: String,
     email: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct UserRequestModel {
+    username: String,
+    password: String,
+    email: String,
+}
+
+impl User {
+    fn new(username: String, password: String, email: String) -> Self {
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        User {
+            id, username, password, email
+        }
+    }
+}
+
+#[get("/check")]
+pub async fn check() -> impl Responder {
+    info!("Check endpoint called");
+    HttpResponse::Ok().json("Ok")
+}
+
 #[post("/register")]
-pub async fn register_user(pool: web::Data<PgPool>, user: web::Json<User>) -> impl Responder {
-    let hashed_password = bcrypt::hash(&user.password, 6).expect("Failed to hash password");
+pub async fn register_user(pool: web::Data<PgPool>, new_user: web::Json<UserRequestModel>) -> impl Responder {
+    info!("Registering user: {}", new_user.username);
+
+    let hashed_password = match bcrypt::hash(&new_user.password, 6) {
+        Ok(pwd) => pwd,
+        Err(e) => {
+            error!("Failed to hash password: {:?}", e);
+            return HttpResponse::InternalServerError().json("Failed to hash password");
+        }
+    };
+
+    let user = User {
+        id: COUNTER.fetch_add(1, Ordering::SeqCst),
+        username: new_user.username.clone(),
+        password: hashed_password,
+        email: new_user.email.clone(),
+    };
 
     let result = sqlx::query!(
         "INSERT INTO users (id, username, password, email) VALUES ($1, $2, $3, $4)",
-        Uuid::new_v4(),
+        user.id as i32,
         user.username,
-        hashed_password,
+        user.password,
         user.email,
     )
     .execute(pool.get_ref())
     .await;
 
     match result {
-        Ok(_) => HttpResponse::Ok().json("User Registered Successfully"),
-        Err(_) => HttpResponse::InternalServerError().json("Failed to Register User"),
+        Ok(_) => {
+            info!("User {} registered successfully", user.username);
+            HttpResponse::Ok().json("User Registered Successfully")
+        }
+        Err(e) => {
+            error!("Failed to register user: {:?}", e);
+            HttpResponse::InternalServerError().json("Failed to Register User")
+        }
     }
 }
 
 #[post("/login")]
-pub async fn login(pool: web::Data<PgPool>, login_info: web::Json<User>) -> impl Responder {
+pub async fn login(pool: web::Data<PgPool>, login_info: web::Json<UserRequestModel>) -> impl Responder {
     let row = sqlx::query!(
         "SELECT password FROM users WHERE username = $1",
         login_info.username
@@ -52,3 +99,4 @@ pub async fn login(pool: web::Data<PgPool>, login_info: web::Json<User>) -> impl
         Err(_) => HttpResponse::Unauthorized().json("Invalid username or password"),
     }
 }
+
